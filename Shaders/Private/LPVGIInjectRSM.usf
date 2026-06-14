@@ -1,0 +1,124 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// inject from the sun's rsm. rgb is the lit color (= flux, already shadowed), alpha
+// is depth in cm. for each texel rebuild the world pos from the ortho basis, get a
+// normal off the depth, and drop the flux in as an sh cosine lobe. the capture follows
+// the sun not the camera so this stays stable and full range no matter where you look
+
+#include "LPVGICommon.ush"
+
+Texture2D<float4> RSMTexture; // RGB = flux, A = linear depth (cm)
+RWTexture3D<int> RWAccum;
+
+// last frame's light field for this cascade, for the bounce feedback
+Texture3D FeedbackR;
+Texture3D FeedbackG;
+Texture3D FeedbackB;
+
+float3 CaptureOrigin;
+float3 AxisRight;
+float3 AxisUp;
+float3 AxisForward;
+float3 VolumeMin;     // world-space min corner of the volume box
+float3 SunColor;      // for estimating surface albedo from captured flux
+float  OrthoWidth;    // world size covered by the square RSM
+float  MaxDepth;      // background cutoff (cm)
+float  CellSize;
+float  FixedPointScale;
+float  Feedback;      // second-bounce strength
+int    HasFeedback;
+int    Resolution;
+
+float3 LPVGI_RSMReconstructWorld(int2 Texel, float Depth)
+{
+	const float2 UV = (float2(Texel) + 0.5f) / (float)Resolution;
+	const float2 NDC = float2(UV.x * 2.0f - 1.0f, 1.0f - UV.y * 2.0f);
+	const float Half = 0.5f * OrthoWidth;
+	return CaptureOrigin
+		+ AxisRight   * (NDC.x * Half)
+		+ AxisUp      * (NDC.y * Half)
+		+ AxisForward * Depth;
+}
+
+[numthreads(8, 8, 1)]
+void InjectRSMCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId.xy >= (uint2)Resolution))
+	{
+		return;
+	}
+
+	const int2 Texel = (int2)DispatchThreadId.xy;
+	const float4 Sample = RSMTexture.Load(int3(Texel, 0));
+	const float Depth = Sample.a;
+	if (Depth <= 1.0f || Depth >= MaxDepth) // background / no geometry
+	{
+		return;
+	}
+
+	const float3 WorldPos = LPVGI_RSMReconstructWorld(Texel, Depth);
+	const float3 Flux = Sample.rgb;
+
+	// rebuild the normal from the neighbour depth samples
+	const int2 TexelX = min(Texel + int2(1, 0), Resolution - 1);
+	const int2 TexelY = min(Texel + int2(0, 1), Resolution - 1);
+	const float DepthX = RSMTexture.Load(int3(TexelX, 0)).a;
+	const float DepthY = RSMTexture.Load(int3(TexelY, 0)).a;
+	const float3 PosX = LPVGI_RSMReconstructWorld(TexelX, DepthX);
+	const float3 PosY = LPVGI_RSMReconstructWorld(TexelY, DepthY);
+	float3 Normal = normalize(cross(PosX - WorldPos, PosY - WorldPos));
+	// flip it toward the light, rsm surfaces face the sun
+	if (dot(Normal, -AxisForward) < 0.0f)
+	{
+		Normal = -Normal;
+	}
+
+	// world -> cell
+	const float3 Cellf = (WorldPos - VolumeMin) / CellSize;
+	if (any(Cellf < 0.0f) || any(Cellf >= (float)LPVGI_GRID_SIZE))
+	{
+		return;
+	}
+	const int3 Cell = clamp((int3)floor(Cellf), 0, LPVGI_GRID_SIZE - 1);
+
+	// second bounce: take what hit this surface last frame and bounce it off the
+	// surface's (rough) albedo, that becomes extra flux
+	float3 Radiance = Flux;
+	if (HasFeedback != 0)
+	{
+		const float4 BasisN = LPVGI_SHBasis(Normal);
+		const float3 Incident = max(0.0f, float3(
+			dot(FeedbackR.Load(int4(Cell, 0)), BasisN),
+			dot(FeedbackG.Load(int4(Cell, 0)), BasisN),
+			dot(FeedbackB.Load(int4(Cell, 0)), BasisN)));
+		const float3 Albedo = saturate(Flux / max(SunColor, 0.001f));
+		Radiance += Albedo * Incident * Feedback;
+	}
+
+	// inject as an sh cosine lobe
+	UNROLL
+	for (int c = 0; c < 3; ++c)
+	{
+		const float4 SH = LPVGI_CosineLobeSH(Normal, Radiance[c]);
+		UNROLL
+		for (int k = 0; k < 4; ++k)
+		{
+			const int Z = Cell.z * LPVGI_PACK_PER_CELL + c * 4 + k;
+			const int Quantised = (int)round(SH[k] * FixedPointScale);
+			InterlockedAdd(RWAccum[int3(Cell.x, Cell.y, Z)], Quantised);
+		}
+	}
+
+	const int CountZ = Cell.z * LPVGI_PACK_PER_CELL + LPVGI_COUNT_CHANNEL;
+	InterlockedAdd(RWAccum[int3(Cell.x, Cell.y, CountZ)], 1);
+
+	// feed the geometry volume from this surface too
+	const float4 GV = LPVGI_CosineLobeSH(Normal, 1.0f);
+	UNROLL
+	for (int g = 0; g < 4; ++g)
+	{
+		const int Z = Cell.z * LPVGI_PACK_PER_CELL + LPVGI_GV_CHANNEL + g;
+		const int Quantised = (int)round(GV[g] * FixedPointScale);
+		InterlockedAdd(RWAccum[int3(Cell.x, Cell.y, Z)], Quantised);
+	}
+}

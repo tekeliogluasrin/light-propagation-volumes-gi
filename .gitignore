@@ -1,0 +1,6 @@
+# Unreal build artifacts — never commit these for a plugin repo
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+*.pdb

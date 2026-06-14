@@ -1,0 +1,82 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// screen-space inject fallback. scatters each visible gbuffer pixel's reflected
+// radiance into the volume as an sh cosine lobe. uses int atomics since lots of
+// pixels land in the same cell, plus a per-cell count so we can average after
+
+#include "LPVGICommon.ush"
+
+RWTexture3D<int> RWAccum;          // (G, G, G * LPVGI_PACK_PER_CELL), PF_R32_SINT
+Texture2D<float> SceneDepthTexture; // device Z
+Texture2D GBufferATexture;          // world normal (encoded)
+Texture2D GBufferCTexture;          // base colour
+
+float3 SunDirection; // direction the sunlight travels
+float3 SunColor;
+float3 SkyColor;
+float3 VolumeSnapOffset; // grid-snap offset added to the camera-centred volume
+float  CellSize;
+float  FixedPointScale;
+int2   ViewportSize;
+
+[numthreads(8, 8, 1)]
+void InjectCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId.xy >= (uint2)ViewportSize))
+	{
+		return;
+	}
+
+	const int3 PixelCoord = int3(DispatchThreadId.xy, 0);
+	const float DeviceZ = SceneDepthTexture.Load(PixelCoord);
+	if (DeviceZ <= 0.0f) // reversed-Z: 0 == far plane / sky, nothing to bounce
+	{
+		return;
+	}
+
+	const float3 TranslatedWorldPos = LPVGI_DeviceZToTranslatedWorld(float2(DispatchThreadId.xy) + 0.5f, DeviceZ);
+
+	const float3 N = normalize(GBufferATexture.Load(PixelCoord).xyz * 2.0f - 1.0f);
+	const float3 Albedo = GBufferCTexture.Load(PixelCoord).rgb;
+
+	// reflected radiance, no shadowing on this fallback path
+	const float NdotL = saturate(dot(N, -SunDirection));
+	const float3 Radiance = Albedo * (SunColor * NdotL + SkyColor);
+
+	const float3 CenterTWS = View.TranslatedWorldCameraOrigin + VolumeSnapOffset;
+	const float3 UVW = LPVGI_WorldToUVW(TranslatedWorldPos, CenterTWS, CellSize);
+	if (any(UVW < 0.0f) || any(UVW > 1.0f))
+	{
+		return;
+	}
+
+	int3 Cell = (int3)floor(UVW * LPVGI_GRID_SIZE);
+	Cell = clamp(Cell, 0, LPVGI_GRID_SIZE - 1);
+
+	UNROLL
+	for (int c = 0; c < 3; ++c)
+	{
+		const float4 SH = LPVGI_CosineLobeSH(N, Radiance[c]);
+		UNROLL
+		for (int k = 0; k < 4; ++k)
+		{
+			const int Z = Cell.z * LPVGI_PACK_PER_CELL + c * 4 + k;
+			const int Quantised = (int)round(SH[k] * FixedPointScale);
+			InterlockedAdd(RWAccum[int3(Cell.x, Cell.y, Z)], Quantised);
+		}
+	}
+
+	const int CountZ = Cell.z * LPVGI_PACK_PER_CELL + LPVGI_COUNT_CHANNEL;
+	InterlockedAdd(RWAccum[int3(Cell.x, Cell.y, CountZ)], 1);
+
+	// geometry volume: drop a unit blocker lobe along the normal so propagation
+	// gets occluded by solid surfaces
+	const float4 GV = LPVGI_CosineLobeSH(N, 1.0f);
+	UNROLL
+	for (int g = 0; g < 4; ++g)
+	{
+		const int Z = Cell.z * LPVGI_PACK_PER_CELL + LPVGI_GV_CHANNEL + g;
+		const int Quantised = (int)round(GV[g] * FixedPointScale);
+		InterlockedAdd(RWAccum[int3(Cell.x, Cell.y, Z)], Quantised);
+	}
+}

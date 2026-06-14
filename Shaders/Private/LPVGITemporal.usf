@@ -1,0 +1,55 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// temporal blend: mix this frame's light field with last frame's reprojected history
+// (just an ema). both volumes snap to the same world grid so the reprojection is an
+// exact whole-cell shift, no blur. this is what kills the flicker under camera motion + taa
+
+#include "LPVGICommon.ush"
+
+Texture3D ThisR;
+Texture3D ThisG;
+Texture3D ThisB;
+Texture3D HistoryR;
+Texture3D HistoryG;
+Texture3D HistoryB;
+SamplerState HistorySampler;
+RWTexture3D<float4> RWOutR;
+RWTexture3D<float4> RWOutG;
+RWTexture3D<float4> RWOutB;
+
+float3 CellShift; // previousCell = currentCell + CellShift
+float  Alpha;     // weight of the current frame (0 = frozen history, 1 = no smoothing)
+int    HasHistory;
+
+[numthreads(4, 4, 4)]
+void TemporalCS(uint3 Cell : SV_DispatchThreadID)
+{
+	if (any(Cell >= (uint)LPVGI_GRID_SIZE))
+	{
+		return;
+	}
+
+	float4 CurR = ThisR.Load(int4(Cell, 0));
+	float4 CurG = ThisG.Load(int4(Cell, 0));
+	float4 CurB = ThisB.Load(int4(Cell, 0));
+
+	if (HasHistory != 0)
+	{
+		const float3 PrevUVW = (float3(Cell) + 0.5f + CellShift) / (float)LPVGI_GRID_SIZE;
+		if (all(PrevUVW >= 0.0f) && all(PrevUVW <= 1.0f))
+		{
+			const float4 HR = HistoryR.SampleLevel(HistorySampler, PrevUVW, 0);
+			const float4 HG = HistoryG.SampleLevel(HistorySampler, PrevUVW, 0);
+			const float4 HB = HistoryB.SampleLevel(HistorySampler, PrevUVW, 0);
+			CurR = lerp(HR, CurR, Alpha);
+			CurG = lerp(HG, CurG, Alpha);
+			CurB = lerp(HB, CurB, Alpha);
+		}
+		// cells that fell outside last frame's volume just keep the current value
+		// and converge over the next few frames
+	}
+
+	RWOutR[Cell] = CurR;
+	RWOutG[Cell] = CurG;
+	RWOutB[Cell] = CurB;
+}

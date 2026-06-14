@@ -1,0 +1,90 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// one propagation step. each cell gathers sh radiance from its 6 neighbours,
+// reprojects the flux through the shared face as a cosine lobe, writes it to the
+// next working volume and adds it onto the accum. accum is read from a prev srv and
+// written to a next uav so we never need typed uav loads. geometry volume occludes it
+
+#include "LPVGICommon.ush"
+
+Texture3D CurR;
+Texture3D CurG;
+Texture3D CurB;
+Texture3D GeometryVolume;
+Texture3D AccumPrevR;
+Texture3D AccumPrevG;
+Texture3D AccumPrevB;
+RWTexture3D<float4> RWNextR;
+RWTexture3D<float4> RWNextG;
+RWTexture3D<float4> RWNextB;
+RWTexture3D<float4> RWAccumNextR;
+RWTexture3D<float4> RWAccumNextG;
+RWTexture3D<float4> RWAccumNextB;
+
+int   UseOcclusion;
+float OcclusionStrength;
+
+// solid angle of the face directly facing a neighbour cell
+static const float LPVGI_DIRECT_FACE_SA = 0.4006696846f / PI;
+
+static const float3 LPVGI_NEIGHBOURS[6] =
+{
+	float3( 1, 0, 0), float3(-1, 0, 0),
+	float3( 0, 1, 0), float3( 0,-1, 0),
+	float3( 0, 0, 1), float3( 0, 0,-1)
+};
+
+[numthreads(4, 4, 4)]
+void PropagateCS(uint3 Cell : SV_DispatchThreadID)
+{
+	if (any(Cell >= (uint)LPVGI_GRID_SIZE))
+	{
+		return;
+	}
+
+	float4 OutR = 0.0f;
+	float4 OutG = 0.0f;
+	float4 OutB = 0.0f;
+
+	UNROLL
+	for (int i = 0; i < 6; ++i)
+	{
+		// light comes into this cell along Dir, from the neighbour on the other side
+		const float3 Dir = LPVGI_NEIGHBOURS[i];
+		const int3 NCell = (int3)Cell - (int3)Dir;
+		if (any(NCell < 0) || any(NCell >= LPVGI_GRID_SIZE))
+		{
+			continue;
+		}
+
+		const float4 NR = CurR.Load(int4(NCell, 0));
+		const float4 NG = CurG.Load(int4(NCell, 0));
+		const float4 NB = CurB.Load(int4(NCell, 0));
+
+		// how much radiance the neighbour sends our way (along Dir)
+		const float4 BasisDir = LPVGI_SHBasis(Dir);
+		const float RadR = max(0.0f, dot(NR, BasisDir));
+		const float RadG = max(0.0f, dot(NG, BasisDir));
+		const float RadB = max(0.0f, dot(NB, BasisDir));
+
+		float Transmit = LPVGI_DIRECT_FACE_SA;
+		if (UseOcclusion != 0)
+		{
+			const float4 GV = GeometryVolume.Load(int4(NCell, 0));
+			const float Occ = saturate(max(0.0f, dot(GV, BasisDir)) * OcclusionStrength);
+			Transmit *= (1.0f - Occ);
+		}
+
+		OutR += LPVGI_CosineLobeSH(Dir, RadR * Transmit);
+		OutG += LPVGI_CosineLobeSH(Dir, RadG * Transmit);
+		OutB += LPVGI_CosineLobeSH(Dir, RadB * Transmit);
+	}
+
+	RWNextR[Cell] = OutR;
+	RWNextG[Cell] = OutG;
+	RWNextB[Cell] = OutB;
+
+	RWAccumNextR[Cell] = AccumPrevR.Load(int4(Cell, 0)) + OutR;
+	RWAccumNextG[Cell] = AccumPrevG.Load(int4(Cell, 0)) + OutG;
+	RWAccumNextB[Cell] = AccumPrevB.Load(int4(Cell, 0)) + OutB;
+}

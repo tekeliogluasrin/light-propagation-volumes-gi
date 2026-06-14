@@ -1,0 +1,37 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// builds the occlusion volume from the engine's global sdf instead of from injected
+// surfaces. for each cell we ask how far the nearest surface is, cells inside a thin
+// band become blockers. way denser than the injected version so it leaks a lot less
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+#include "LPVGICommon.ush"
+
+RWTexture3D<float4> RWGeometryVolume;
+float3 VolumeSnapOffset;
+float CellSize;
+float Thickness; // blocker band half-width, in cells
+
+[numthreads(4, 4, 4)]
+void BuildGVCS(uint3 Cell : SV_DispatchThreadID)
+{
+	if (any(Cell >= (uint)LPVGI_GRID_SIZE))
+	{
+		return;
+	}
+
+	float Occlusion = 0.0f;
+
+#if PLATFORM_SUPPORTS_DISTANCE_FIELDS
+	const float3 CenterTWS = View.TranslatedWorldCameraOrigin + VolumeSnapOffset;
+	const float3 MinTWS = CenterTWS - 0.5f * (float)LPVGI_GRID_SIZE * CellSize;
+	const float3 CellCenterTWS = MinTWS + (float3(Cell) + 0.5f) * CellSize;
+
+	const float Distance = GetDistanceToNearestSurfaceGlobal(CellCenterTWS);
+	Occlusion = saturate(1.0f - abs(Distance) / max(Thickness * CellSize, 1.0f));
+#endif
+
+	// store it isotropic (just the sh dc term) so it blocks from every direction inside solids
+	RWGeometryVolume[Cell] = float4(Occlusion / 0.282094792f, 0.0f, 0.0f, 0.0f);
+}

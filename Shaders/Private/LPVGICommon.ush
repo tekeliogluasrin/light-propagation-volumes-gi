@@ -1,0 +1,55 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// shared bits for all the lpv passes: 2-band sh, the volume layout, world<->cell mapping
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+
+// grid resolution, keep in sync with the c++ side
+#define LPVGI_GRID_SIZE 32
+
+// how each cell is packed in the int accum volume (along z):
+//   0..11 : radiance sh, 4 per color (r,g,b)
+//   12    : sample count, for averaging
+//   13..16: geometry volume (occlusion) sh
+#define LPVGI_PACK_PER_CELL 17
+#define LPVGI_COUNT_CHANNEL  12
+#define LPVGI_GV_CHANNEL     13
+
+// 2-band real SH basis evaluated for unit direction d.
+float4 LPVGI_SHBasis(float3 d)
+{
+	return float4(
+		 0.282094792f,
+		-0.488602512f * d.y,
+		 0.488602512f * d.z,
+		-0.488602512f * d.x);
+}
+
+// sh of a clamped cosine lobe along normal n, scaled by w.
+// this is how we inject a surface's radiance with its direction
+float4 LPVGI_CosineLobeSH(float3 n, float w)
+{
+	const float c0 = 0.886226925f; // sqrt(PI)/2
+	const float c1 = 1.023326708f; // sqrt(PI/3)
+	return w * float4(
+		c0 *  0.282094792f,
+		c1 * -0.488602512f * n.y,
+		c1 *  0.488602512f * n.z,
+		c1 * -0.488602512f * n.x);
+}
+
+// translated-world pos -> volume uvw [0,1] for a camera-centered box
+float3 LPVGI_WorldToUVW(float3 TranslatedWorldPos, float3 CenterTWS, float CellSize)
+{
+	const float Extent = LPVGI_GRID_SIZE * CellSize;
+	const float3 MinCorner = CenterTWS - 0.5f * Extent;
+	return (TranslatedWorldPos - MinCorner) / Extent;
+}
+
+// rebuild translated-world pos from a pixel coord + its device z
+float3 LPVGI_DeviceZToTranslatedWorld(float2 PixelCenter, float DeviceZ)
+{
+	const float4 Hom = mul(float4(PixelCenter, DeviceZ, 1.0f), View.SVPositionToTranslatedWorld);
+	return Hom.xyz / Hom.w;
+}

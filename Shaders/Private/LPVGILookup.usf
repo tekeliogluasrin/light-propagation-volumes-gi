@@ -1,0 +1,113 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// lookup + composite. for each opaque pixel find the finest cascade that holds its
+// world pos, eval the sh toward the surface normal, multiply by albedo and add the
+// indirect into scene color. cascades blend near their edges so the transition hides
+
+#include "LPVGICommon.ush"
+
+#define LPVGI_MAX_CASCADES 4
+
+Texture2D<float> SceneDepthTexture;
+Texture2D GBufferATexture;
+Texture2D GBufferCTexture;
+
+Texture3D Volume0R; Texture3D Volume0G; Texture3D Volume0B;
+Texture3D Volume1R; Texture3D Volume1G; Texture3D Volume1B;
+Texture3D Volume2R; Texture3D Volume2G; Texture3D Volume2B;
+Texture3D Volume3R; Texture3D Volume3G; Texture3D Volume3B;
+SamplerState VolumeSampler;
+
+float4 CascadeParams[LPVGI_MAX_CASCADES]; // xyz = snap offset (translated), w = cell size
+int    NumCascades;
+float  EdgeFadeFrac; // outer fraction of a cascade used to fade to the next
+float  Intensity;
+int    DebugView;
+
+float3 LPVGI_EvalCascade(int Cascade, float3 UVW, float4 Basis)
+{
+	float4 R, G, B;
+	switch (Cascade)
+	{
+	case 0: R = Volume0R.SampleLevel(VolumeSampler, UVW, 0); G = Volume0G.SampleLevel(VolumeSampler, UVW, 0); B = Volume0B.SampleLevel(VolumeSampler, UVW, 0); break;
+	case 1: R = Volume1R.SampleLevel(VolumeSampler, UVW, 0); G = Volume1G.SampleLevel(VolumeSampler, UVW, 0); B = Volume1B.SampleLevel(VolumeSampler, UVW, 0); break;
+	case 2: R = Volume2R.SampleLevel(VolumeSampler, UVW, 0); G = Volume2G.SampleLevel(VolumeSampler, UVW, 0); B = Volume2B.SampleLevel(VolumeSampler, UVW, 0); break;
+	default: R = Volume3R.SampleLevel(VolumeSampler, UVW, 0); G = Volume3G.SampleLevel(VolumeSampler, UVW, 0); B = Volume3B.SampleLevel(VolumeSampler, UVW, 0); break;
+	}
+	return max(float3(dot(R, Basis), dot(G, Basis), dot(B, Basis)), 0.0f);
+}
+
+float3 LPVGI_CascadeUVW(int Cascade, float3 TranslatedWorldPos)
+{
+	const float3 Center = View.TranslatedWorldCameraOrigin + CascadeParams[Cascade].xyz;
+	return LPVGI_WorldToUVW(TranslatedWorldPos, Center, CascadeParams[Cascade].w);
+}
+
+void LookupPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+	const int3 PixelCoord = int3((int2)SvPosition.xy, 0);
+	const float DeviceZ = SceneDepthTexture.Load(PixelCoord);
+	if (DeviceZ <= 0.0f)
+	{
+		return;
+	}
+
+	const float3 TranslatedWorldPos = LPVGI_DeviceZToTranslatedWorld(SvPosition.xy, DeviceZ);
+	const float3 N = normalize(GBufferATexture.Load(PixelCoord).xyz * 2.0f - 1.0f);
+	const float3 Albedo = GBufferCTexture.Load(PixelCoord).rgb;
+	const float4 Basis = LPVGI_SHBasis(N);
+
+	float3 Irradiance = 0.0f;
+	bool bFound = false;
+
+	for (int c = 0; c < NumCascades; ++c)
+	{
+		const float3 UVW = LPVGI_CascadeUVW(c, TranslatedWorldPos);
+		if (any(UVW < 0.0f) || any(UVW > 1.0f))
+		{
+			continue; // not inside this cascade, try the next (coarser) one
+		}
+
+		const float3 Edge = min(UVW, 1.0f - UVW);       // 0 at face, 0.5 at centre
+		const float NearestEdge = min(Edge.x, min(Edge.y, Edge.z));
+		const float Fade = saturate(NearestEdge / max(EdgeFadeFrac, 1e-4f));
+
+		const float3 Here = LPVGI_EvalCascade(c, UVW, Basis);
+
+		if (Fade >= 1.0f || c == NumCascades - 1)
+		{
+			Irradiance = Here;
+		}
+		else
+		{
+			// near the edge, blend into the next coarser cascade
+			const float3 NextUVW = LPVGI_CascadeUVW(c + 1, TranslatedWorldPos);
+			const float3 Next = LPVGI_EvalCascade(c + 1, NextUVW, Basis);
+			Irradiance = lerp(Next, Here, Fade);
+		}
+		bFound = true;
+		break;
+	}
+
+	if (!bFound)
+	{
+		return;
+	}
+
+	const float3 Indirect = Albedo * Irradiance * Intensity;
+
+	if (DebugView == 1)
+	{
+		OutColor = float4(Indirect, 1.0f);
+	}
+	else if (DebugView == 2)
+	{
+		OutColor = float4(Irradiance * Intensity, 1.0f);
+	}
+	else
+	{
+		OutColor = float4(Indirect, 0.0f);
+	}
+}

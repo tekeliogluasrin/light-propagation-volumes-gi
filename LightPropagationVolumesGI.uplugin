@@ -1,0 +1,23 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "Light Propagation Volumes GI",
+	"Description": "Free, open-source real-time global illumination using cascaded Light Propagation Volumes. Integrates through Unreal Engine's 'Plugin' dynamic GI hook with no engine modification required.",
+	"Category": "Rendering",
+	"CreatedBy": "h1dr4x0",
+	"CreatedByURL": "https://github.com/h1dr4x0",
+	"DocsURL": "https://github.com/h1dr4x0/light-propagation-volumes-gi",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/h1dr4x0/light-propagation-volumes-gi/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "LightPropagationVolumesGI",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

@@ -1,0 +1,58 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// decode the int accum volume into float sh volumes, averaged by the per-cell count.
+// seeds both the propagation working set (cur) and the accum buffer with the injected
+// light, and decodes the geometry volume used by propagation
+
+#include "LPVGICommon.ush"
+
+Texture3D<int>      AccumTexture; // (G, G, G * LPVGI_PACK_PER_CELL)
+RWTexture3D<float4> RWCurR;
+RWTexture3D<float4> RWCurG;
+RWTexture3D<float4> RWCurB;
+RWTexture3D<float4> RWAccumR;
+RWTexture3D<float4> RWAccumG;
+RWTexture3D<float4> RWAccumB;
+RWTexture3D<float4> RWGeometryVolume;
+float InvFixedPointScale;
+
+[numthreads(4, 4, 4)]
+void ConvertCS(uint3 Cell : SV_DispatchThreadID)
+{
+	if (any(Cell >= (uint)LPVGI_GRID_SIZE))
+	{
+		return;
+	}
+
+	const int CountZ = Cell.z * LPVGI_PACK_PER_CELL + LPVGI_COUNT_CHANNEL;
+	const int Count = AccumTexture.Load(int4(Cell.x, Cell.y, CountZ, 0));
+	const float Norm = (Count > 0) ? (InvFixedPointScale / (float)Count) : 0.0f;
+
+	float4 SH[3];
+	UNROLL
+	for (int c = 0; c < 3; ++c)
+	{
+		UNROLL
+		for (int k = 0; k < 4; ++k)
+		{
+			const int Z = Cell.z * LPVGI_PACK_PER_CELL + c * 4 + k;
+			SH[c][k] = AccumTexture.Load(int4(Cell.x, Cell.y, Z, 0)) * Norm;
+		}
+	}
+
+	float4 GV;
+	UNROLL
+	for (int g = 0; g < 4; ++g)
+	{
+		const int Z = Cell.z * LPVGI_PACK_PER_CELL + LPVGI_GV_CHANNEL + g;
+		GV[g] = AccumTexture.Load(int4(Cell.x, Cell.y, Z, 0)) * Norm;
+	}
+
+	RWCurR[Cell] = SH[0];
+	RWCurG[Cell] = SH[1];
+	RWCurB[Cell] = SH[2];
+	RWAccumR[Cell] = SH[0];
+	RWAccumG[Cell] = SH[1];
+	RWAccumB[Cell] = SH[2];
+	RWGeometryVolume[Cell] = GV;
+}
