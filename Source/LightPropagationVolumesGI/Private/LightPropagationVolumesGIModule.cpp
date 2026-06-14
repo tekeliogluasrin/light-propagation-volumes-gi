@@ -400,9 +400,7 @@ struct FLPVGICascadeContext
 	FGlobalIlluminationPluginResources* Resources = nullptr;
 	FIntPoint ViewportSize = FIntPoint::ZeroValue;
 	FLPVGISunSkyState SunSky;
-	FLPVGIRSMState RSM;
-	FRDGTextureRef RSMTexture = nullptr;
-	bool bUseRSM = false;
+	bool bRSMMode = false; // inject from per-cascade RSM (vs screen-space fallback)
 	int32 PropagationSteps = 0;
 	int32 UseOcclusion = 0;
 	float OcclusionStrength = 1.0f;
@@ -448,34 +446,39 @@ void FLightPropagationVolumesGIModule::RenderCascade(
 	FRDGTextureRef HistR = bValidHistory ? GraphBuilder.RegisterExternalTexture(HistoryVolume[H + 0]) : nullptr;
 	FRDGTextureRef HistG = bValidHistory ? GraphBuilder.RegisterExternalTexture(HistoryVolume[H + 1]) : nullptr;
 	FRDGTextureRef HistB = bValidHistory ? GraphBuilder.RegisterExternalTexture(HistoryVolume[H + 2]) : nullptr;
-	const bool bFeedback = bValidHistory && Ctx.Feedback > 0.0f && Ctx.bUseRSM;
+	// this cascade's own rsm (captured round-robin, so it may be a frame or two old)
+	const FLPVGIRSMState Rsm = LPVGI_GetRSMState(CascadeIndex);
+	FRHITexture* RsmRHI = (Ctx.bRSMMode && Rsm.bValid && Rsm.Resource != nullptr) ? Rsm.Resource->GetRenderTargetTexture() : nullptr;
+	const bool bUseRSM = (RsmRHI != nullptr);
+	const bool bFeedback = bValidHistory && Ctx.Feedback > 0.0f && bUseRSM;
 
-	if (Ctx.bUseRSM)
+	if (bUseRSM)
 	{
 		FRDGTextureRef BlackVol = RegisterExternalTexture(GraphBuilder, GBlackVolumeTexture->TextureRHI, TEXT("LPVGI.BlackVol"));
+		FRDGTextureRef RSMTexture = RegisterExternalTexture(GraphBuilder, RsmRHI, TEXT("LPVGI.RSM"));
 
 		FLPVGIInjectRSMCS::FParameters* Params = GraphBuilder.AllocParameters<FLPVGIInjectRSMCS::FParameters>();
-		Params->RSMTexture = Ctx.RSMTexture;
+		Params->RSMTexture = RSMTexture;
 		Params->RWAccum = AccumUAV;
 		Params->FeedbackR = bFeedback ? HistR : BlackVol;
 		Params->FeedbackG = bFeedback ? HistG : BlackVol;
 		Params->FeedbackB = bFeedback ? HistB : BlackVol;
-		Params->CaptureOrigin = Ctx.RSM.CaptureOrigin;
-		Params->AxisRight = Ctx.RSM.AxisRight;
-		Params->AxisUp = Ctx.RSM.AxisUp;
-		Params->AxisForward = Ctx.RSM.AxisForward;
+		Params->CaptureOrigin = Rsm.CaptureOrigin;
+		Params->AxisRight = Rsm.AxisRight;
+		Params->AxisUp = Rsm.AxisUp;
+		Params->AxisForward = Rsm.AxisForward;
 		Params->VolumeMin = VolumeMin;
 		Params->SunColor = Ctx.SunSky.bValidSun ? Ctx.SunSky.SunColor : FVector3f(1.0f, 1.0f, 1.0f);
-		Params->OrthoWidth = Ctx.RSM.OrthoWidth;
-		Params->MaxDepth = Ctx.RSM.MaxDepth;
+		Params->OrthoWidth = Rsm.OrthoWidth;
+		Params->MaxDepth = Rsm.MaxDepth;
 		Params->CellSize = CellSize;
 		Params->FixedPointScale = GLPVGIFixedPointScale;
 		Params->Feedback = Ctx.Feedback;
 		Params->HasFeedback = bFeedback ? 1 : 0;
-		Params->Resolution = Ctx.RSM.Resolution;
+		Params->Resolution = Rsm.Resolution;
 
 		TShaderMapRef<FLPVGIInjectRSMCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		const FIntVector GroupCount(FMath::DivideAndRoundUp(Ctx.RSM.Resolution, 8), FMath::DivideAndRoundUp(Ctx.RSM.Resolution, 8), 1);
+		const FIntVector GroupCount(FMath::DivideAndRoundUp(Rsm.Resolution, 8), FMath::DivideAndRoundUp(Rsm.Resolution, 8), 1);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("LPVGI::InjectRSM"), ComputeShader, Params, GroupCount);
 	}
 	else
@@ -637,24 +640,20 @@ void FLightPropagationVolumesGIModule::OnRenderDiffuseIndirectLight(
 		return FVector(FMath::FloorToDouble(P.X / Cell) * Cell, FMath::FloorToDouble(P.Y / Cell) * Cell, FMath::FloorToDouble(P.Z / Cell) * Cell);
 	};
 
-	// point the rsm capture at the biggest cascade so one capture covers all of them
-	const float LargestCell = BaseCellSize * (float)(1 << (NumCascadesReq - 1));
-	const FVector LargestCenter = SnapToGrid(CamWorld, (double)LargestCell);
-	{
-		FLPVGIVolumeFocus Focus;
-		Focus.WorldCenter = LargestCenter;
-		Focus.WorldExtent = GLPVGIGridSize * LargestCell;
-		Focus.bValid = true;
-		LPVGI_SetVolumeFocus(Focus);
-		LPVGI_SetRSMResolution(CVarLPVGIRSMResolution.GetValueOnRenderThread());
-	}
+	const int32 NumCascades = (InjectMode != 0) ? NumCascadesReq : 1;
 
-	const FLPVGIRSMState RSM = LPVGI_GetRSMState();
-	// the rt resource can exist before its rhi texture is ready (first frames)
-	// so fall back to screen-space until then
-	FRHITexture* RSMRHI = (RSM.bValid && RSM.Resource != nullptr) ? RSM.Resource->GetRenderTargetTexture() : nullptr;
-	const bool bUseRSM = (InjectMode != 0) && (RSMRHI != nullptr);
-	const int32 NumCascades = bUseRSM ? NumCascadesReq : 1;
+	// each cascade gets its own rsm sized to it, captured one per frame (round robin).
+	// tell the game thread where to aim each
+	FLPVGIVolumeFocus Focuses[MaxCascades];
+	for (int32 c = 0; c < NumCascades; ++c)
+	{
+		const float CellSizeC = BaseCellSize * (float)(1 << c);
+		Focuses[c].WorldCenter = SnapToGrid(CamWorld, (double)CellSizeC);
+		Focuses[c].WorldExtent = GLPVGIGridSize * CellSizeC;
+		Focuses[c].bValid = true;
+	}
+	LPVGI_SetVolumeFocus(Focuses, NumCascades);
+	LPVGI_SetRSMResolution(CVarLPVGIRSMResolution.GetValueOnRenderThread());
 
 	RDG_EVENT_SCOPE(GraphBuilder, "LPVGI");
 
@@ -663,9 +662,7 @@ void FLightPropagationVolumesGIModule::OnRenderDiffuseIndirectLight(
 	Ctx.Resources = &Resources;
 	Ctx.ViewportSize = ViewportSize;
 	Ctx.SunSky = SunSky;
-	Ctx.RSM = RSM;
-	Ctx.RSMTexture = bUseRSM ? RegisterExternalTexture(GraphBuilder, RSMRHI, TEXT("LPVGI.RSM")) : nullptr;
-	Ctx.bUseRSM = bUseRSM;
+	Ctx.bRSMMode = (InjectMode != 0);
 	Ctx.PropagationSteps = FMath::Clamp(CVarLPVGIPropagationSteps.GetValueOnRenderThread(), 0, 64);
 	Ctx.UseOcclusion = (CVarLPVGIOcclusion.GetValueOnRenderThread() != 0) ? 1 : 0;
 	Ctx.OcclusionStrength = CVarLPVGIOcclusionStrength.GetValueOnRenderThread();

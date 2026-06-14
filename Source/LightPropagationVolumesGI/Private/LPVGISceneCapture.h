@@ -5,6 +5,9 @@
 
 class FTextureRenderTargetResource;
 
+// must match MaxCascades in the module
+static constexpr int32 LPVGI_MAX_CASCADES = 4;
+
 // sun + sky grabbed on the game thread, read by the inject pass on the render thread
 struct FLPVGISunSkyState
 {
@@ -15,27 +18,27 @@ struct FLPVGISunSkyState
 	bool bValidSky = false;
 };
 
-// rsm capture output, game thread -> render thread.
-// we run an ortho scenecapture2d aimed along the sun, grabbing lit color (= flux) + depth.
-// the render thread rebuilds each texel's world pos from this basis and injects it
+// rsm capture output for one cascade, game thread -> render thread.
+// each cascade has its own capture aimed along the sun, so it samples at the right
+// density. the render thread rebuilds each texel's world pos from this basis and injects
 struct FLPVGIRSMState
 {
 	FTextureRenderTargetResource* Resource = nullptr; // RGBA16f: RGB=flux, A=linear depth (cm)
-	FVector3f CaptureOrigin = FVector3f::ZeroVector;  // world-space capture camera location
+	FVector3f CaptureOrigin = FVector3f::ZeroVector;
 	FVector3f AxisRight = FVector3f(1.0f, 0.0f, 0.0f);
 	FVector3f AxisUp = FVector3f(0.0f, 1.0f, 0.0f);
 	FVector3f AxisForward = FVector3f(0.0f, 0.0f, 1.0f); // == sun travel direction
-	float OrthoWidth = 1000.0f;   // world size covered (square)
-	float MaxDepth = 8000.0f;     // far cutoff (cm) for background rejection
+	float OrthoWidth = 1000.0f;
+	float MaxDepth = 8000.0f;
 	int32 Resolution = 512;
 	bool bValid = false;
 };
 
-// where the render thread wants the capture centered (follows the camera)
+// where the render thread wants each cascade's capture centered (follows the camera)
 struct FLPVGIVolumeFocus
 {
 	FVector WorldCenter = FVector::ZeroVector;
-	float WorldExtent = 1280.0f; // GridSize * CellSize
+	float WorldExtent = 1280.0f;
 	bool bValid = false;
 };
 
@@ -44,11 +47,12 @@ void LPVGI_StopSceneCapture();
 
 FLPVGISunSkyState LPVGI_GetSunSkyState();
 
-// render thread tells the game thread where to aim the capture this frame
-void LPVGI_SetVolumeFocus(const FLPVGIVolumeFocus& Focus);
+// render thread tells the game thread where each cascade should be aimed this frame.
+// the game thread captures one cascade per frame (round robin), reusing the rest
+void LPVGI_SetVolumeFocus(const FLPVGIVolumeFocus* Focuses, int32 NumCascades);
 
-// render thread reads the latest capture basis + target
-FLPVGIRSMState LPVGI_GetRSMState();
+// render thread reads the latest capture for a given cascade
+FLPVGIRSMState LPVGI_GetRSMState(int32 CascadeIndex);
 
-// rsm resolution, picked up next time the rt is (re)created
+// rsm resolution, picked up next time the rts are (re)created
 void LPVGI_SetRSMResolution(int32 Resolution);
