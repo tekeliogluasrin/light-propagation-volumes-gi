@@ -16,6 +16,7 @@ indirect lighting.
   (SceneCapture, public API), so it's stable under camera motion and any AA.
 - Cascaded volumes (up to 4) for both near detail and long range.
 - SH light propagation with Global SDF occlusion to limit light leaking.
+- Diffuse plus cheap glossy/specular GI sampled from the volume in the reflection direction.
 - Temporal accumulation with grid-snapped reprojection, virtually flicker-free.
 - Multi-bounce indirect lighting via light-field feedback.
 - Sun shadows come for free (the captured flux is already shadowed).
@@ -62,6 +63,7 @@ r.AOGlobalDistanceField.DetailedNecessityCheck=0
 |------|---------|-------------|
 | `r.LPVGI.Enable` | 1 | Master on/off. |
 | `r.LPVGI.Intensity` | 4 | Overall indirect light intensity. |
+| `r.LPVGI.Specular` | 1 | Glossy/specular GI strength (0 = diffuse only). |
 | `r.LPVGI.CellSize` | 50 | Cell size (cm) of the first (finest) cascade. |
 | `r.LPVGI.NumCascades` | 3 | Number of nested cascades (1–4). Each is 2× coarser/larger. |
 | `r.LPVGI.EdgeFade` | 0.15 | Cross-cascade blend region (fraction of a cascade). |

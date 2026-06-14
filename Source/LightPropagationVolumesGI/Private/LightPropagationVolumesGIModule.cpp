@@ -58,6 +58,11 @@ static TAutoConsoleVariable<float> CVarLPVGIIntensity(
 	TEXT("Overall intensity multiplier for the indirect light composited into scene colour."),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<float> CVarLPVGISpecular(
+	TEXT("r.LPVGI.Specular"), 1.0f,
+	TEXT("Glossy/specular GI strength sampled from the volume in the reflection direction (0 = diffuse only)."),
+	ECVF_RenderThreadSafe);
+
 static TAutoConsoleVariable<int32> CVarLPVGIPropagationSteps(
 	TEXT("r.LPVGI.PropagationSteps"), 8,
 	TEXT("Number of light propagation iterations (0 = injection only, no spreading)."),
@@ -292,6 +297,7 @@ public:
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, SceneDepthTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GBufferATexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GBufferBTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GBufferCTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D, Volume0R)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D, Volume0G)
@@ -310,6 +316,7 @@ public:
 		SHADER_PARAMETER(int32, NumCascades)
 		SHADER_PARAMETER(float, EdgeFadeFrac)
 		SHADER_PARAMETER(float, Intensity)
+		SHADER_PARAMETER(float, SpecularIntensity)
 		SHADER_PARAMETER(int32, DebugView)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
@@ -730,6 +737,7 @@ void FLightPropagationVolumesGIModule::OnRenderDiffuseIndirectLight(
 		Params->View = SceneView.ViewUniformBuffer;
 		Params->SceneDepthTexture = Resources.SceneDepthZ;
 		Params->GBufferATexture = Resources.GBufferA;
+		Params->GBufferBTexture = Resources.GBufferB;
 		Params->GBufferCTexture = Resources.GBufferC;
 		Params->Volume0R = CascadeVolumes[0][0]; Params->Volume0G = CascadeVolumes[0][1]; Params->Volume0B = CascadeVolumes[0][2];
 		Params->Volume1R = CascadeVolumes[1][0]; Params->Volume1G = CascadeVolumes[1][1]; Params->Volume1B = CascadeVolumes[1][2];
@@ -743,6 +751,7 @@ void FLightPropagationVolumesGIModule::OnRenderDiffuseIndirectLight(
 		Params->NumCascades = NumCascades;
 		Params->EdgeFadeFrac = FMath::Clamp(CVarLPVGIEdgeFade.GetValueOnRenderThread(), 0.0f, 0.49f);
 		Params->Intensity = CVarLPVGIIntensity.GetValueOnRenderThread();
+		Params->SpecularIntensity = FMath::Max(0.0f, CVarLPVGISpecular.GetValueOnRenderThread());
 		Params->DebugView = DebugView;
 		Params->RenderTargets[0] = FRenderTargetBinding(Resources.SceneColor, ERenderTargetLoadAction::ELoad);
 

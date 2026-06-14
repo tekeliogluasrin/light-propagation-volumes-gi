@@ -1,8 +1,9 @@
 // Copyright (c) LPVPGI contributors. Open source (see LICENSE).
 
 // lookup + composite. for each opaque pixel find the finest cascade that holds its
-// world pos, eval the sh toward the surface normal, multiply by albedo and add the
-// indirect into scene color. cascades blend near their edges so the transition hides
+// world pos, eval the sh toward the normal for diffuse and toward the reflection
+// vector for a cheap glossy bounce, then add both into scene color. cascades blend
+// near their edges so the transition hides
 
 #include "LPVGICommon.ush"
 
@@ -10,6 +11,7 @@
 
 Texture2D<float> SceneDepthTexture;
 Texture2D GBufferATexture;
+Texture2D GBufferBTexture;
 Texture2D GBufferCTexture;
 
 Texture3D Volume0R; Texture3D Volume0G; Texture3D Volume0B;
@@ -20,13 +22,13 @@ SamplerState VolumeSampler;
 
 float4 CascadeParams[LPVGI_MAX_CASCADES]; // xyz = snap offset (translated), w = cell size
 int    NumCascades;
-float  EdgeFadeFrac; // outer fraction of a cascade used to fade to the next
+float  EdgeFadeFrac;
 float  Intensity;
+float  SpecularIntensity;
 int    DebugView;
 
-float3 LPVGI_EvalCascade(int Cascade, float3 UVW, float4 Basis)
+void LPVGI_SampleCascadeSH(int Cascade, float3 UVW, out float4 R, out float4 G, out float4 B)
 {
-	float4 R, G, B;
 	switch (Cascade)
 	{
 	case 0: R = Volume0R.SampleLevel(VolumeSampler, UVW, 0); G = Volume0G.SampleLevel(VolumeSampler, UVW, 0); B = Volume0B.SampleLevel(VolumeSampler, UVW, 0); break;
@@ -34,13 +36,47 @@ float3 LPVGI_EvalCascade(int Cascade, float3 UVW, float4 Basis)
 	case 2: R = Volume2R.SampleLevel(VolumeSampler, UVW, 0); G = Volume2G.SampleLevel(VolumeSampler, UVW, 0); B = Volume2B.SampleLevel(VolumeSampler, UVW, 0); break;
 	default: R = Volume3R.SampleLevel(VolumeSampler, UVW, 0); G = Volume3G.SampleLevel(VolumeSampler, UVW, 0); B = Volume3B.SampleLevel(VolumeSampler, UVW, 0); break;
 	}
-	return max(float3(dot(R, Basis), dot(G, Basis), dot(B, Basis)), 0.0f);
 }
 
 float3 LPVGI_CascadeUVW(int Cascade, float3 TranslatedWorldPos)
 {
 	const float3 Center = View.TranslatedWorldCameraOrigin + CascadeParams[Cascade].xyz;
 	return LPVGI_WorldToUVW(TranslatedWorldPos, Center, CascadeParams[Cascade].w);
+}
+
+// grab the sh from the finest cascade that contains twp, blended into the next near the edge.
+// returns false if the point is past the last cascade
+bool LPVGI_SampleSH(float3 TranslatedWorldPos, out float4 R, out float4 G, out float4 B)
+{
+	R = 0.0f; G = 0.0f; B = 0.0f;
+
+	for (int c = 0; c < NumCascades; ++c)
+	{
+		const float3 UVW = LPVGI_CascadeUVW(c, TranslatedWorldPos);
+		if (any(UVW < 0.0f) || any(UVW > 1.0f))
+		{
+			continue;
+		}
+
+		float4 r, g, b;
+		LPVGI_SampleCascadeSH(c, UVW, r, g, b);
+
+		const float3 Edge = min(UVW, 1.0f - UVW);
+		const float Fade = saturate(min(Edge.x, min(Edge.y, Edge.z)) / max(EdgeFadeFrac, 1e-4f));
+
+		if (Fade >= 1.0f || c == NumCascades - 1)
+		{
+			R = r; G = g; B = b;
+			return true;
+		}
+
+		const float3 NextUVW = LPVGI_CascadeUVW(c + 1, TranslatedWorldPos);
+		float4 r2, g2, b2;
+		LPVGI_SampleCascadeSH(c + 1, NextUVW, r2, g2, b2);
+		R = lerp(r2, r, Fade); G = lerp(g2, g, Fade); B = lerp(b2, b, Fade);
+		return true;
+	}
+	return false;
 }
 
 void LookupPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
@@ -55,48 +91,41 @@ void LookupPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
 	}
 
 	const float3 TranslatedWorldPos = LPVGI_DeviceZToTranslatedWorld(SvPosition.xy, DeviceZ);
-	const float3 N = normalize(GBufferATexture.Load(PixelCoord).xyz * 2.0f - 1.0f);
-	const float3 Albedo = GBufferCTexture.Load(PixelCoord).rgb;
-	const float4 Basis = LPVGI_SHBasis(N);
 
-	float3 Irradiance = 0.0f;
-	bool bFound = false;
-
-	for (int c = 0; c < NumCascades; ++c)
-	{
-		const float3 UVW = LPVGI_CascadeUVW(c, TranslatedWorldPos);
-		if (any(UVW < 0.0f) || any(UVW > 1.0f))
-		{
-			continue; // not inside this cascade, try the next (coarser) one
-		}
-
-		const float3 Edge = min(UVW, 1.0f - UVW);       // 0 at face, 0.5 at centre
-		const float NearestEdge = min(Edge.x, min(Edge.y, Edge.z));
-		const float Fade = saturate(NearestEdge / max(EdgeFadeFrac, 1e-4f));
-
-		const float3 Here = LPVGI_EvalCascade(c, UVW, Basis);
-
-		if (Fade >= 1.0f || c == NumCascades - 1)
-		{
-			Irradiance = Here;
-		}
-		else
-		{
-			// near the edge, blend into the next coarser cascade
-			const float3 NextUVW = LPVGI_CascadeUVW(c + 1, TranslatedWorldPos);
-			const float3 Next = LPVGI_EvalCascade(c + 1, NextUVW, Basis);
-			Irradiance = lerp(Next, Here, Fade);
-		}
-		bFound = true;
-		break;
-	}
-
-	if (!bFound)
+	float4 ShR, ShG, ShB;
+	if (!LPVGI_SampleSH(TranslatedWorldPos, ShR, ShG, ShB))
 	{
 		return;
 	}
 
-	const float3 Indirect = Albedo * Irradiance * Intensity;
+	const float3 N = normalize(GBufferATexture.Load(PixelCoord).xyz * 2.0f - 1.0f);
+	const float3 Albedo = GBufferCTexture.Load(PixelCoord).rgb;
+	const float4 GBufferB = GBufferBTexture.Load(PixelCoord);
+	const float Metallic = GBufferB.r;
+	const float SpecularParam = GBufferB.g;
+
+	// diffuse: eval toward the surface normal
+	const float4 BasisN = LPVGI_SHBasis(N);
+	const float3 Diffuse = max(0.0f, float3(dot(ShR, BasisN), dot(ShG, BasisN), dot(ShB, BasisN)));
+
+	// specular: eval toward the reflected view direction. the volume is low frequency
+	// so this reads like a rough/glossy reflection, which is what we want
+	const float Roughness = GBufferB.b;
+	const float3 V = normalize(View.TranslatedWorldCameraOrigin - TranslatedWorldPos);
+	const float NoV = saturate(dot(N, V));
+	const float3 RefDir = reflect(-V, N);
+	const float4 BasisR = LPVGI_SHBasis(RefDir);
+	const float3 SpecRadiance = max(0.0f, float3(dot(ShR, BasisR), dot(ShG, BasisR), dot(ShB, BasisR)));
+
+	const float3 DiffuseAlbedo = Albedo * (1.0f - Metallic);
+	const float3 F0 = lerp((0.08f * SpecularParam).xxx, Albedo, Metallic);
+	// schlick fresnel, brightens the reflection at grazing angles
+	const float3 Fresnel = F0 + (1.0f - F0) * pow(1.0f - NoV, 5.0f);
+	// volume can only do blurry reflections, so fade specular out on very smooth
+	// surfaces where that blur would look wrong
+	const float SpecWeight = SpecularIntensity * saturate(Roughness * 1.4f + 0.15f);
+
+	const float3 Indirect = (DiffuseAlbedo * Diffuse + Fresnel * SpecRadiance * SpecWeight) * Intensity;
 
 	if (DebugView == 1)
 	{
@@ -104,7 +133,7 @@ void LookupPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
 	}
 	else if (DebugView == 2)
 	{
-		OutColor = float4(Irradiance * Intensity, 1.0f);
+		OutColor = float4(Diffuse * Intensity, 1.0f);
 	}
 	else
 	{
