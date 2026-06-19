@@ -99,6 +99,22 @@ sharp contact shadows, fine ambient occlusion, or glossy reflections (combine
 with Distance Field AO for contact detail). Enclosed volumes may still exhibit a
 little light leaking. Quality scales with cascade resolution and cell size.
 
+## Known issues
+
+This plugin is still under active development and a few areas are not yet finished:
+
+- **Performance tuning is ongoing.** The renderer works and is already reasonably
+  cheap, but the optimization pass for low-end hardware isn't complete yet. Some
+  passes (volumetric god-ray shadow tracing, the far cascade updates) can still be
+  made faster without changing the output. Expect frame-cost improvements in later
+  versions.
+- **GI-coloured volumetric fog is experimental.** The optional volumetric pass
+  (`r.LPVGI.Volumetric`) that tints fog with bounce light is new and still being
+  polished. It's off by default; enable it if you want to try it.
+- **A few rough edges remain.** Some parameters and edge cases (very large cell
+  sizes, extreme intensities, tight enclosed rooms) still need polish and better
+  defaults. Feedback and bug reports are welcome.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Free for any use, including commercial.
