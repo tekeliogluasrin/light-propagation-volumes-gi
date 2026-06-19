@@ -3,6 +3,10 @@
 #include "LightPropagationVolumesGIModule.h"
 #include "GlobalIlluminationPluginMirror.h"
 #include "LPVGISceneCapture.h"
+#include "LPVGIVolumetric.h"
+#include "SceneViewExtension.h"
+#include "Engine/Engine.h"
+#include "Misc/CoreDelegates.h"
 
 #include "Modules/ModuleManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -357,6 +361,18 @@ namespace
 }
 
 // module
+void FLightPropagationVolumesGIModule::CreateVolumetricViewExtension()
+{
+	if (!VolumetricGIState.IsValid())
+	{
+		VolumetricGIState = MakeShared<FLPVGIVolumetricGIState, ESPMode::ThreadSafe>();
+	}
+	if (!VolumetricViewExtension.IsValid())
+	{
+		VolumetricViewExtension = FSceneViewExtensions::NewExtension<FLPVGIVolumetricViewExtension>(VolumetricGIState);
+	}
+}
+
 void FLightPropagationVolumesGIModule::StartupModule()
 {
 	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("LightPropagationVolumesGI")))
@@ -366,6 +382,16 @@ void FLightPropagationVolumesGIModule::StartupModule()
 	}
 
 	LPVGI_StartSceneCapture();
+
+	// the view extension registry isn't ready at PostConfigInit, so wait for engine init
+	if (GEngine)
+	{
+		CreateVolumetricViewExtension();
+	}
+	else
+	{
+		PostEngineInitHandle = FCoreDelegates::OnPostEngineInit.AddRaw(this, &FLightPropagationVolumesGIModule::CreateVolumetricViewExtension);
+	}
 
 	RenderDiffuseIndirectLightHandle =
 		FGlobalIlluminationPluginDelegates::RenderDiffuseIndirectLight().AddRaw(
@@ -383,6 +409,13 @@ void FLightPropagationVolumesGIModule::ShutdownModule()
 	}
 
 	LPVGI_StopSceneCapture();
+
+	if (PostEngineInitHandle.IsValid())
+	{
+		FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
+		PostEngineInitHandle.Reset();
+	}
+	VolumetricViewExtension.Reset();
 
 	for (int32 i = 0; i < MaxCascades * 3; ++i)
 	{
@@ -768,6 +801,30 @@ void FLightPropagationVolumesGIModule::OnRenderDiffuseIndirectLight(
 			Params,
 			FIntRect(0, 0, ViewportSize.X, ViewportSize.Y),
 			Blend);
+	}
+
+	// hand the propagated light field to the volumetric pass (gi-coloured fog). convert the
+	// final cascade volumes (the same ones Lookup just used) to external resources so they
+	// are available to the volumetric pass in this very frame (it runs later in the same
+	// graph). this is independent of temporal and has no frame latency
+	if (VolumetricGIState.IsValid())
+	{
+		FLPVGIVolumetricGIState& S = *VolumetricGIState;
+		int32 ValidVols = 0;
+		for (int32 c = 0; c < NumCascades; ++c)
+		{
+			for (int32 ch = 0; ch < 3; ++ch)
+			{
+				S.Volumes[c * 3 + ch] = GraphBuilder.ConvertToExternalTexture(CascadeVolumes[c][ch]);
+				ValidVols += S.Volumes[c * 3 + ch].IsValid() ? 1 : 0;
+			}
+		}
+		for (int32 c = 0; c < MaxCascades; ++c)
+		{
+			S.CascadeParams[c] = CascadeParams[c];
+		}
+		S.NumCascades = NumCascades;
+		S.bValid = (ValidVols > 0);
 	}
 }
 

@@ -12,6 +12,8 @@ class FRDGBuilder;
 class FGlobalIlluminationPluginResources;
 struct IPooledRenderTarget;
 struct FLPVGICascadeContext;
+class FLPVGIVolumetricViewExtension;
+struct FLPVGIVolumetricGIState;
 
 // hooks into UE's "Plugin" dynamic GI path and renders a cascaded LPV light field
 // (inject -> convert -> propagate -> temporal -> composite). no engine changes
@@ -42,6 +44,16 @@ private:
 		FRDGTextureRef OutVolumes[3]);
 
 	FDelegateHandle RenderDiffuseIndirectLightHandle;
+
+	// post-process scene view extension that draws the (optional) volumetrics.
+	// created on post engine init (too early to register during PostConfigInit)
+	void CreateVolumetricViewExtension();
+	TSharedPtr<FLPVGIVolumetricViewExtension, ESPMode::ThreadSafe> VolumetricViewExtension;
+	FDelegateHandle PostEngineInitHandle;
+
+	// the propagated lpv light field, shared with the volumetric pass so the fog can pick up
+	// bounce-light colour. filled at the end of each gi render, read on the render thread
+	TSharedPtr<FLPVGIVolumetricGIState, ESPMode::ThreadSafe> VolumetricGIState;
 
 	// keep in sync with LPVGI_MAX_CASCADES in the shaders
 	static constexpr int32 MaxCascades = 4;

@@ -1,0 +1,341 @@
+// Copyright (c) LPVPGI contributors. Open source (see LICENSE).
+
+// raymarched volumetric fog with god-ray shadows. the heavy raymarch (MainPS) runs at
+// a lower resolution into its own (inscatter, transmittance) target, then UpsamplePS
+// samples that and composites it over full-res scene colour. fog is low frequency so
+// the half-res march is hard to notice but roughly 4x cheaper
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+#include "LPVGICommon.ush"
+
+Texture2D SceneColorTexture;
+Texture2D VolumetricTexture;       // low-res (inscatter.rgb, transmittance.a) from MainPS
+Texture2D VolumetricDepthTexture;  // low-res linear depth from MainPS, for bilateral upsample
+SamplerState VolumetricSampler;
+float2 VolBufferSize;              // low-res target size in texels
+
+float3 SunDirection;     // direction the sunlight travels
+float3 SunColor;
+float3 FogScatterColor;  // ambient in-scatter
+float  FogDensity;       // extinction per cm (how hazy the scene gets)
+float  ScatterScale;     // in-scatter boost, independent of extinction (bright beams, thin fog)
+float  MaxDistance;      // cm
+float  PhaseG;           // henyey-greenstein anisotropy
+float  SideScatter;      // view-independent floor on the sun phase (side-visible shafts)
+int    NumSteps;
+int4   ViewportRect;     // valid view region (minx,miny,maxx,maxy) inside the texture
+int    SunShadow;        // god-ray shadows on/off
+int    SunShadowSteps;   // sdf sphere-trace steps toward the sun
+float  SunShadowMaxDist; // cm
+float  SunShadowSoftness;
+
+// the propagated lpv light field, so the fog can pick up bounce-light colour. this is the
+// thing stock ue/lumen volumetrics never do: gi-coloured fog (a red wall tints the haze red)
+Texture3D GIVolume0R; Texture3D GIVolume0G; Texture3D GIVolume0B;
+Texture3D GIVolume1R; Texture3D GIVolume1G; Texture3D GIVolume1B;
+Texture3D GIVolume2R; Texture3D GIVolume2G; Texture3D GIVolume2B;
+Texture3D GIVolume3R; Texture3D GIVolume3G; Texture3D GIVolume3B;
+SamplerState GIVolumeSampler;
+float4 GICascadeParams[4]; // xyz = snap offset (translated), w = cell size
+int    GINumCascades;
+float  GIIntensity;
+int    UseGI;
+int    GIDebug; // 0 off, 1 show UseGI flag (green/red), 2 show raw gi colour at the surface
+
+// dc (average) sh value per colour from one cascade. used by the debug views only
+float3 LPVGI_SampleGICascadeDC(int Cascade, float3 UVW)
+{
+	float r, g, b;
+	switch (Cascade)
+	{
+	case 0:  r = GIVolume0R.SampleLevel(GIVolumeSampler, UVW, 0).x; g = GIVolume0G.SampleLevel(GIVolumeSampler, UVW, 0).x; b = GIVolume0B.SampleLevel(GIVolumeSampler, UVW, 0).x; break;
+	case 1:  r = GIVolume1R.SampleLevel(GIVolumeSampler, UVW, 0).x; g = GIVolume1G.SampleLevel(GIVolumeSampler, UVW, 0).x; b = GIVolume1B.SampleLevel(GIVolumeSampler, UVW, 0).x; break;
+	case 2:  r = GIVolume2R.SampleLevel(GIVolumeSampler, UVW, 0).x; g = GIVolume2G.SampleLevel(GIVolumeSampler, UVW, 0).x; b = GIVolume2B.SampleLevel(GIVolumeSampler, UVW, 0).x; break;
+	default: r = GIVolume3R.SampleLevel(GIVolumeSampler, UVW, 0).x; g = GIVolume3G.SampleLevel(GIVolumeSampler, UVW, 0).x; b = GIVolume3B.SampleLevel(GIVolumeSampler, UVW, 0).x; break;
+	}
+	return float3(r, g, b);
+}
+
+// radiance per colour from one cascade, evaluated toward direction BasisD. we already pay
+// for the full float4 fetch, so doing the directional sh dot instead of just reading .x is
+// basically free but gives a much richer look: the fog reads the bounce light arriving from
+// that direction, so it brightens/tints when you look toward a lit surface
+float3 LPVGI_SampleGICascadeDir(int Cascade, float3 UVW, float4 BasisD)
+{
+	float4 R, G, B;
+	switch (Cascade)
+	{
+	case 0:  R = GIVolume0R.SampleLevel(GIVolumeSampler, UVW, 0); G = GIVolume0G.SampleLevel(GIVolumeSampler, UVW, 0); B = GIVolume0B.SampleLevel(GIVolumeSampler, UVW, 0); break;
+	case 1:  R = GIVolume1R.SampleLevel(GIVolumeSampler, UVW, 0); G = GIVolume1G.SampleLevel(GIVolumeSampler, UVW, 0); B = GIVolume1B.SampleLevel(GIVolumeSampler, UVW, 0); break;
+	case 2:  R = GIVolume2R.SampleLevel(GIVolumeSampler, UVW, 0); G = GIVolume2G.SampleLevel(GIVolumeSampler, UVW, 0); B = GIVolume2B.SampleLevel(GIVolumeSampler, UVW, 0); break;
+	default: R = GIVolume3R.SampleLevel(GIVolumeSampler, UVW, 0); G = GIVolume3G.SampleLevel(GIVolumeSampler, UVW, 0); B = GIVolume3B.SampleLevel(GIVolumeSampler, UVW, 0); break;
+	}
+	return float3(dot(R, BasisD), dot(G, BasisD), dot(B, BasisD));
+}
+
+// bounce-light colour in the fog at translated-world pos P, for a ray going ViewDir. pick the
+// finest cascade that holds P (no edge blend, fog is low frequency so the seam doesn't show)
+// and eval the sh toward -ViewDir, the radiance travelling toward the eye. the dc term still
+// dominates (the stable average colour) while the directional bands add the tint variation.
+// returns 0 outside every cascade so distant fog stays neutral. raw form ignores the UseGI gate
+float3 LPVGI_SampleGIRaw(float3 P, float3 ViewDir)
+{
+	const float4 BasisD = LPVGI_SHBasis(-ViewDir); // light arriving toward the camera
+
+	LOOP
+	for (int c = 0; c < GINumCascades; ++c)
+	{
+		const float Extent = (float)LPVGI_GRID_SIZE * GICascadeParams[c].w;
+		const float3 Center = View.TranslatedWorldCameraOrigin + GICascadeParams[c].xyz;
+		const float3 UVW = (P - (Center - 0.5f * Extent)) / Extent;
+		if (any(UVW < 0.0f) || any(UVW > 1.0f))
+		{
+			continue;
+		}
+
+		return max(0.0f, LPVGI_SampleGICascadeDir(c, UVW, BasisD)) * GIIntensity;
+	}
+	return 0.0f;
+}
+
+float3 LPVGI_SampleGI(float3 P, float3 ViewDir)
+{
+	return (UseGI == 0) ? (float3)0.0f : LPVGI_SampleGIRaw(P, ViewDir);
+}
+
+float LPVGI_HenyeyGreenstein(float CosTheta, float G)
+{
+	const float G2 = G * G;
+	return (1.0f - G2) / (4.0f * PI * pow(max(1.0f + G2 - 2.0f * G * CosTheta, 1e-4f), 1.5f));
+}
+
+// how much sun reaches P, by sphere-tracing the global sdf toward the sun. 0 = fully
+// shadowed, 1 = lit. the soft term gives a penumbra so the shafts aren't hard edged
+float LPVGI_SunVisibility(float3 P)
+{
+	if (SunShadow == 0)
+	{
+		return 1.0f;
+	}
+
+#if PLATFORM_SUPPORTS_DISTANCE_FIELDS
+	const float3 ToSun = -SunDirection;  // sun direction is where the light goes, so flip it
+	float t = 30.0f;                     // start a bit off the sample to avoid self shadow
+	float Vis = 1.0f;
+
+	LOOP
+	for (int i = 0; i < SunShadowSteps; ++i)
+	{
+		const float Dist = GetDistanceToNearestSurfaceGlobal(P + ToSun * t);
+		if (Dist < 1.0f)
+		{
+			return 0.0f;  // hit an occluder, this point is in shadow
+		}
+		Vis = min(Vis, saturate(SunShadowSoftness * Dist / t));
+		t += max(Dist, 20.0f);
+		if (t > SunShadowMaxDist)
+		{
+			break;
+		}
+	}
+	return Vis;
+#else
+	return 1.0f;
+#endif
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0, out float OutDepth : SV_Target1)
+{
+	const uint2 PixelPos = uint2(SvPosition.xy);  // our render target (scene colour) pixel
+
+	// scene colour and scene depth can be at different resolutions (fullscreen upscaling),
+	// so don't read depth at the scene colour pixel directly. map our pixel to a 0..1 uv
+	// across the view, then express that uv in the depth buffer's own render space. this
+	// stays correct whether the two buffers match or not, no rectangle at the depth edge
+	const float2 ColorMin = (float2)ViewportRect.xy;
+	const float2 ColorSize = max((float2)(ViewportRect.zw - ViewportRect.xy), 1.0f);
+	const float2 ViewportUV = saturate((SvPosition.xy - ColorMin) / ColorSize);
+
+	// pixel position inside the depth / view render target (matches the view matrices)
+	const float2 RenderXY = View.ViewRectMin.xy + ViewportUV * View.ViewSizeAndInvSize.xy;
+	const uint2 DepthPos = (uint2)clamp(RenderXY,
+		View.ViewRectMin.xy + 0.5f,
+		View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy - 0.5f);
+	const float DeviceZ = LookupDeviceZ(DepthPos);
+
+	const float3 CamOrigin = View.TranslatedWorldCameraOrigin;
+
+	// reconstruct in render space (same space as the depth + view matrix). a finite mid
+	// depth keeps the ray valid for sky/far pixels (the far plane would give infinity)
+	const float4 HomMid = mul(float4(RenderXY, 0.5f, 1.0f), View.SVPositionToTranslatedWorld);
+	const float3 Dir = normalize(HomMid.xyz / HomMid.w - CamOrigin);
+
+	// distance to the surface, or the max distance for sky (reversed-Z: 0 == far)
+	float MarchDist = MaxDistance;
+	if (DeviceZ > 0.0f)
+	{
+		const float4 HomEnd = mul(float4(RenderXY, DeviceZ, 1.0f), View.SVPositionToTranslatedWorld);
+		MarchDist = min(length(HomEnd.xyz / HomEnd.w - CamOrigin), MaxDistance);
+	}
+
+	// debug views: replace the fog with a direct readout so we can tell what's wrong.
+	//   1 = is gi bound/on? green yes, red no
+	//   2 = uvw of the finest cascade holding the surface point (gradient = inside,
+	//       magenta = outside every cascade -> coordinate/param problem)
+	//   3 = raw volume dc at the cascade-0 uvw, clamped + boosted (tests volume content)
+	//   4 = volume dc at the fixed centre (0.5) of cascade 0 (tests binding only, no coords)
+	if (GIDebug != 0)
+	{
+		const float3 SurfaceP = CamOrigin + Dir * min(MarchDist, MaxDistance);
+		float3 Dbg = 0.0f;
+
+		if (GIDebug == 1)
+		{
+			Dbg = (UseGI != 0) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+		}
+		else if (GIDebug == 2)
+		{
+			Dbg = float3(1.0f, 0.0f, 1.0f); // magenta = surface point outside every cascade
+			LOOP
+			for (int c = 0; c < GINumCascades; ++c)
+			{
+				const float Extent = (float)LPVGI_GRID_SIZE * GICascadeParams[c].w;
+				const float3 Center = View.TranslatedWorldCameraOrigin + GICascadeParams[c].xyz;
+				const float3 UVW = (SurfaceP - (Center - 0.5f * Extent)) / Extent;
+				if (any(UVW < 0.0f) || any(UVW > 1.0f))
+				{
+					continue;
+				}
+				Dbg = UVW; // r=x g=y b=z, a smooth gradient means the mapping is good
+				break;
+			}
+		}
+		else if (GIDebug == 3)
+		{
+			const float Extent = (float)LPVGI_GRID_SIZE * max(GICascadeParams[0].w, 1.0f);
+			const float3 Center = View.TranslatedWorldCameraOrigin + GICascadeParams[0].xyz;
+			const float3 UVW = saturate((SurfaceP - (Center - 0.5f * Extent)) / Extent);
+			Dbg = LPVGI_SampleGICascadeDC(0, UVW) * 50.0f;
+		}
+		else
+		{
+			// scan cascade 0 for ANY content, so an empty probe point can't fool us. if this
+			// stays black the bound volume is genuinely empty (a binding/extraction problem),
+			// not just empty air at one spot
+			float3 m = 0.0f;
+			for (int zi = 0; zi < 8; ++zi)
+			for (int yi = 0; yi < 8; ++yi)
+			for (int xi = 0; xi < 8; ++xi)
+			{
+				const float3 uvw = (float3(xi, yi, zi) + 0.5f) / 8.0f;
+				m = max(m, LPVGI_SampleGICascadeDC(0, uvw));
+			}
+			Dbg = m * 50.0f;
+		}
+
+		// transmittance 0 so the upsample shows Dbg directly (Scene*0 + Dbg)
+		OutColor = float4(Dbg, 0.0f);
+		OutDepth = (DeviceZ > 0.0f) ? ConvertFromDeviceZ(DeviceZ) : 1.0e8f;
+		return;
+	}
+
+	const float StepSize = MarchDist / (float)NumSteps;
+	// forward lobe gives the glow toward the sun, the side floor keeps shafts visible from
+	// any angle so we don't have to crank sun intensity just to see them from the side
+	const float Phase = LPVGI_HenyeyGreenstein(dot(Dir, -SunDirection), PhaseG) + SideScatter;
+
+	// small per-pixel offset to break up banding
+	const float Jitter = frac(dot(float2(PixelPos), float2(0.754877f, 0.569840f)));
+
+	float Transmittance = 1.0f;
+	float3 InScatter = 0.0f;
+
+	LOOP
+	for (int s = 0; s < NumSteps; ++s)
+	{
+		const float3 P = CamOrigin + Dir * (StepSize * ((float)s + Jitter));
+
+		// sun in-scatter gated by god-ray shadow, plus a little flat ambient that is never
+		// shadowed, plus the local lpv bounce light so the fog takes on nearby surface colour
+		const float Vis = LPVGI_SunVisibility(P);
+		const float3 GIInScatter = LPVGI_SampleGI(P, Dir);
+		const float3 Light = SunColor * Phase * Vis + FogScatterColor + GIInScatter;
+
+		// extinction stays tied to density (haze), but in-scatter gets its own scale so the
+		// beams can read bright while the scene behind stays clear
+		InScatter += Transmittance * Light * (FogDensity * ScatterScale) * StepSize;
+		Transmittance *= exp(-FogDensity * StepSize);
+	}
+
+	// store inscatter + transmittance for the upsample/composite pass. no scene colour here
+	OutColor = float4(max(InScatter, 0.0f), saturate(Transmittance));
+	// linear scene depth so the upsample can avoid blending fog across depth edges
+	OutDepth = (DeviceZ > 0.0f) ? ConvertFromDeviceZ(DeviceZ) : 1.0e8f;
+}
+
+// full-res pass: read the low-res volumetric, composite it over scene colour. uses a
+// depth-aware (bilateral) upsample so fog is not blended across geometry edges, which
+// is what made wall silhouettes look jagged with a plain bilinear upsample
+void UpsamplePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const uint2 PixelPos = uint2(SvPosition.xy);
+
+	const float2 ColorMin = (float2)ViewportRect.xy;
+	const float2 ColorSize = max((float2)(ViewportRect.zw - ViewportRect.xy), 1.0f);
+	const float2 ViewportUV = saturate((SvPosition.xy - ColorMin) / ColorSize);
+
+	// full-res scene depth at this pixel, in the depth buffer's render space
+	const float2 RenderXY = View.ViewRectMin.xy + ViewportUV * View.ViewSizeAndInvSize.xy;
+	const uint2 DepthPos = (uint2)clamp(RenderXY,
+		View.ViewRectMin.xy + 0.5f,
+		View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy - 0.5f);
+	const float FullDeviceZ = LookupDeviceZ(DepthPos);
+	const float FullDepth = (FullDeviceZ > 0.0f) ? ConvertFromDeviceZ(FullDeviceZ) : 1.0e8f;
+
+	// 2x2 low-res footprint around this pixel
+	const float2 Texel = ViewportUV * VolBufferSize - 0.5f;
+	const float2 BaseF = floor(Texel);
+	const float2 Frac = Texel - BaseF;
+	const int2 Base = (int2)BaseF;
+	const int2 MaxC = (int2)VolBufferSize - 1;
+
+	// bilinear weights per corner
+	float W[4];
+	W[0] = (1.0f - Frac.x) * (1.0f - Frac.y);
+	W[1] = Frac.x * (1.0f - Frac.y);
+	W[2] = (1.0f - Frac.x) * Frac.y;
+	W[3] = Frac.x * Frac.y;
+
+	const int2 Offs[4] = { int2(0,0), int2(1,0), int2(0,1), int2(1,1) };
+
+	float4 SumVol = 0.0f;
+	float SumW = 0.0f;
+
+	UNROLL
+	for (int i = 0; i < 4; ++i)
+	{
+		const int2 C = clamp(Base + Offs[i], int2(0,0), MaxC);
+		const float4 Vol = VolumetricTexture.Load(int3(C, 0));
+		const float LowDepth = VolumetricDepthTexture.Load(int3(C, 0)).r;
+
+		// down-weight samples whose depth is far from this pixel's depth. the tolerance is
+		// relative to the pixel depth so it works at any scene scale: across a geometry edge
+		// the far-depth sample is rejected and the edge stays crisp; in smooth areas all four
+		// pass and it falls back to plain bilinear
+		const float DepthDiff = abs(LowDepth - FullDepth);
+		const float DepthW = 1.0f / (0.02f * FullDepth + DepthDiff + 1.0f);
+
+		const float Wi = W[i] * DepthW + 1e-6f;
+		SumVol += Vol * Wi;
+		SumW += Wi;
+	}
+
+	const float4 VolFinal = SumVol / SumW;
+	const float3 InScatter = VolFinal.rgb;
+	const float Transmittance = VolFinal.a;
+
+	const float3 Scene = SceneColorTexture.Load(int3(PixelPos, 0)).rgb;
+	OutColor = float4(Scene * Transmittance + InScatter, 1.0f);
+}
